@@ -70,10 +70,10 @@ class LSTMClassifier(nn.Module):
 # ----------------------------
 # Walk-forward (expanding window)
 # ----------------------------
-def walk_forward_validation(raw_features, labels, dates, seq_len=30, train_years=3, step_days=252,
-                            epochs=5, lr=1e-3, threshold=0.5):
+def walk_forward_validation(raw_features, labels, dates, seq_len=SEQ_LEN, train_years=TRAIN_YEARS, step_days=STEP_DAYS,
+                            epochs=EPOCHS, lr=LR, threshold=THRESHOLD):
     n = len(raw_features)
-    train_min = train_years * 252
+    train_min = train_years * step_days
     results = []
 
     # folds iterate by the end-of-train index (exclusive), expanding from the beginning
@@ -219,7 +219,7 @@ def summarize_performance(strategy_ret, intraday_ret, buyhold_ret, signal):
         std = r.std()
         if std == 0 or np.isnan(std):
             return np.nan
-        return r.mean() / std * np.sqrt(252)
+        return r.mean() / std * np.sqrt(STEP_DAYS)
 
     summary["Sharpe (strategy)"] = sharpe(strategy_ret)
     summary["Sharpe (always intraday)"] = sharpe(intraday_ret)
@@ -228,7 +228,7 @@ def summarize_performance(strategy_ret, intraday_ret, buyhold_ret, signal):
     # CAGR (compound annual growth rate)
     def CAGR(equity):
         equity = pd.Series(equity).dropna()
-        years = len(equity) / 252
+        years = len(equity) / STEP_DAYS
         return equity.iloc[-1]**(1/years) - 1 if len(equity) > 0 else np.nan
 
     summary["CAGR (strategy)"] = CAGR((1+strategy_ret).cumprod())
