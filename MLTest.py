@@ -23,7 +23,7 @@ def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 # ---------- params ----------
-ticker = "AAPL"
+ticker = "NTDOF"
 start_date = "2024-01-01"
 end_date   = "2024-12-31"
 
@@ -54,7 +54,7 @@ features = ["Return", "RSI", "EMA_10", "EMA_30"]
 X = df[features]
 y = df["Target"]
 
-split = int(len(df) * 0.50)
+split = int(len(df) * 0.80)
 X_train, X_test = X.iloc[:split], X.iloc[split:]
 y_train, y_test = y.iloc[:split], y.iloc[split:]
 
