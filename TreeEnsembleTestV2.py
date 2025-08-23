@@ -331,6 +331,68 @@ def evaluate_predictions(pred_df: pd.DataFrame, threshold: float = 0.5) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic Threshold
+# ---------------------------------------------------------------------------
+
+def optimize_threshold_online(pred_df, price_df, grid=None, lookback=252):
+    """
+    For each day t, choose the threshold (from `grid`) that would have maximized
+    open->close equity over the prior `lookback` days, using past realized returns only.
+    Returns a pd.Series of thresholds aligned with pred_df.index.
+    """
+    if grid is None:
+        grid = np.round(np.linspace(0.50, 0.70, 21), 3)
+
+    df = pred_df[['pred_ens']].copy()
+    df = df.merge(price_df[['Open','Close']], left_index=True, right_index=True, how='left')
+    oc = (df['Close'] / df['Open'] - 1)  # open->close realized return
+
+    thr_series = pd.Series(index=df.index, dtype=float)
+
+    # Precompute cumulative sums for speed
+    probs = df['pred_ens'].values
+    oc_vals = oc.values
+    n = len(df)
+
+    for i in range(n):
+        start = max(0, i - lookback)
+        if i - start < 20:  # need a minimum history
+            thr_series.iloc[i] = 0.60  # conservative default
+            continue
+
+        best_thr, best_equity = 0.5, -1e9
+        past_probs = probs[start:i]
+        past_oc    = oc_vals[start:i]
+
+        for thr in grid:
+            sig = (past_probs >= thr).astype(int)
+            eq  = np.prod(1 + sig * past_oc)  # equity over lookback
+            if eq > best_equity:
+                best_equity, best_thr = eq, thr
+
+        thr_series.iloc[i] = best_thr
+
+    return thr_series
+
+
+# ---------------------------------------------------------------------------
+# High Confidence Signal Trading
+# ---------------------------------------------------------------------------
+
+def high_confidence_signal(pred_df, q=0.90, lookback=63):
+    """
+    Rolling percentile filter: signal=1 when today's prob is in the top q
+    of the last `lookback` days (uses only past data).
+    """
+    p = pred_df['pred_ens']
+    roll = p.rolling(lookback, min_periods=20)
+    # rolling quantile *of past*, so shift(1) to avoid including today
+    qpast = roll.quantile(q).shift(1)
+    sig = (p >= qpast).astype(int).fillna(0)
+    return sig
+
+
+# ---------------------------------------------------------------------------
 # Default hyperparameters (conservative, stable)
 # ---------------------------------------------------------------------------
 
@@ -371,43 +433,44 @@ def default_params() -> ModelParams:
 
 def compute_equity_curves(pred_df: pd.DataFrame,
                           price_df: pd.DataFrame,
-                          threshold: float = 0.5) -> pd.DataFrame:
+                          threshold: float = 0.5,
+                          rolling_thresholds: Optional[pd.Series] = None,
+                          precomputed_signal: Optional[pd.Series] = None) -> pd.DataFrame:
     df = pred_df.copy()
-
-    # Ensure indices are DateTime and aligned
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    if not isinstance(price_df.index, pd.DatetimeIndex):
-        price_df.index = pd.to_datetime(price_df.index)
-
-    # Make sure price_df has Open/Close
-    if not {'Open','Close'}.issubset(price_df.columns):
-        raise ValueError(f"price_df is missing required OHLC columns. Found: {price_df.columns}")
-
-    # Merge Open/Close into pred_df
     df = df.merge(price_df[['Open','Close']], left_index=True, right_index=True, how='left')
 
-    # Check for correct column names after merge
-    if 'Open' not in df.columns:
-        raise KeyError(f"After merge, 'Open' not found in columns: {df.columns}")
-    if 'Close_y' in df.columns:
-        close_col = 'Close_y'
-    elif 'Close' in df.columns:
+    # After merge, handle possible column names for 'Close'
+    close_col = None
+    if 'Close' in df.columns:
         close_col = 'Close'
+    elif 'Close_y' in df.columns:
+        close_col = 'Close_y'
+    elif 'Close_x' in df.columns:
+        close_col = 'Close_x'
     else:
-        raise KeyError(f"After merge, no 'Close' column found in columns: {df.columns}")
+        raise KeyError(f"No 'Close' column found after merge. Columns: {df.columns}")
 
-    close_to_close = df[close_col].pct_change().fillna(0)
-    open_to_close = (df[close_col] / df['Open'] - 1).fillna(0)
-    open_to_close = open_to_close.shift(-1)  # today's features predict next day's open→close
+    c2c = df[close_col].pct_change().fillna(0)
+    o2c = (df[close_col] / df['Open'] - 1).fillna(0)
 
-    df['signal'] = (df['pred_ens'] >= threshold).astype(int).shift(1).fillna(0)
-    strat_rets = df['signal'] * open_to_close
+    if precomputed_signal is not None:
+        sig = precomputed_signal.reindex(df.index).fillna(0).astype(int)
+    elif rolling_thresholds is not None:
+        thr = rolling_thresholds.reindex(df.index).fillna(threshold)
+        sig = (df['pred_ens'] >= thr).astype(int)
+    else:
+        sig = (df['pred_ens'] >= threshold).astype(int)
 
-    curves = pd.DataFrame({
-        'Strategy': (1 + strat_rets).cumprod(),
-        'AlwaysLong_Intraday': (1 + open_to_close).cumprod(),
-        'BuyHold_Close2Close': (1 + close_to_close).cumprod()
+    # Trade today's open->close using **yesterday's** decision
+    sig = sig.shift(1).fillna(0).astype(int)
+
+    strat = (1 + sig * o2c).cumprod()
+    always = (1 + o2c).cumprod()
+    buyhold = (1 + c2c).cumprod()
+    return pd.DataFrame({
+        'Strategy': strat,
+        'AlwaysLong_Intraday': always,
+        'BuyHold_Close2Close': buyhold
     }, index=df.index)
 
     return curves
@@ -489,7 +552,7 @@ def run_experiment(df: Optional[pd.DataFrame] = None,
     if plot:
         plot_equity_curves(curves, ticker)
 
-    return pred_df, metrics, curves
+    return pred_df, metrics, curves, data
 
 
 
@@ -508,6 +571,7 @@ def sweep_experiments(ticker: str,
     Run multiple experiments across seeds, learning rates, and thresholds.
     Plot equity curves (strategy + baselines) for comparison.
     """
+    data_cache = {}     # Prevent re-downloading data
     all_curves = {}
 
     for seed in seeds:
@@ -517,11 +581,12 @@ def sweep_experiments(ticker: str,
                     for LGBM_num_leaves_exp in LGBM_num_leaves:
                         label = f"seed={seed},lr={lr},thr={thr},XGBoost_max_depth={XGBoost_max_depth_exp},LGBM_num_leaves={LGBM_num_leaves_exp}"
                         print(f"Running {label} ...")
-                        preds, metrics, curves = run_experiment(
-                            ticker=ticker,
-                            start=start,
-                            end=end,
-                            cfg=cfg,
+                        if ticker not in data_cache:
+                            preds, metrics, curves, raw_data = run_experiment(
+                                ticker=ticker,
+                                start=start,
+                                end=end,
+                                cfg=cfg,
                             seed=seed,
                             lr_xgb=lr,
                             lr_lgb=lr,
@@ -531,11 +596,40 @@ def sweep_experiments(ticker: str,
                             LGBM_num_leaves_exp=LGBM_num_leaves_exp,
                             skip_training=are_skip_training
                         )
-                        all_curves[label] = curves['Strategy']  # store strategy only
-                        if 'AlwaysLong_Intraday' not in all_curves:
-                            all_curves['AlwaysLong_Intraday'] = curves['AlwaysLong_Intraday']
+                            data_cache[ticker] = raw_data
+                        else:
+                            preds, metrics, curves, _ = run_experiment(
+                                ticker=ticker,
+                                start=start,
+                                end=end,
+                                cfg=cfg,
+                            seed=seed,
+                            lr_xgb=lr,
+                            lr_lgb=lr,
+                            threshold=thr,
+                            plot=False,   # suppress per-run plotting
+                            XGBoost_max_depth_exp=XGBoost_max_depth_exp,
+                            LGBM_num_leaves_exp=LGBM_num_leaves_exp,
+                            skip_training=are_skip_training
+                        )
+                        # Baselines (store once)
                         if 'BuyHold_Close2Close' not in all_curves:
                             all_curves['BuyHold_Close2Close'] = curves['BuyHold_Close2Close']
+                        if 'AlwaysLong_Intraday' not in all_curves:
+                            all_curves['AlwaysLong_Intraday'] = curves['AlwaysLong_Intraday']
+
+                        # 1) Fixed threshold (as before)
+                        all_curves[f"{label} (fixed)"] = curves['Strategy']
+
+                        # 2) Online optimized threshold
+                        thr_series = optimize_threshold_online(preds, data_cache[ticker])  # ensure you pass the same raw OHLC df used in run_experiment
+                        curves_opt = compute_equity_curves(preds, data_cache[ticker], rolling_thresholds=thr_series)
+                        all_curves[f"{label} (online-thr)"] = curves_opt['Strategy']
+
+                        # 3) High-confidence filter (top decile)
+                        sig_q = high_confidence_signal(preds, q=0.90, lookback=63)
+                        curves_q = compute_equity_curves(preds, data_cache[ticker], precomputed_signal=sig_q)
+                        all_curves[f"{label} (top10%)"] = curves_q['Strategy']
 
     # Plot everything
     plt.figure(figsize=(12,6))
@@ -549,6 +643,7 @@ def sweep_experiments(ticker: str,
     plt.show()
 
     return all_curves
+
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +693,7 @@ if __name__ == "__main__":
     lrs=[0.03],
     thresholds=[0.5],
     are_skip_training=False,
-    XGBoost_max_depth=[2,4,6],                               # Originally 4
-    LGBM_num_leaves=[30,63,120],                                # Originally 63
+    XGBoost_max_depth=[4],                               # Originally 4
+    LGBM_num_leaves=[63],                                # Originally 63
 
     )
